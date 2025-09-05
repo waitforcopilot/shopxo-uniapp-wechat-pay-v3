@@ -102,6 +102,10 @@
                 pay_response_data: {},
                 // 支付确认弹窗
                 payment_confirm_modal_status: false,
+                // 第4次优化：微信支付v3状态管理
+                wechat_pay_v3_retry_count: 0,
+                wechat_pay_v3_max_retries: 3,
+                wechat_pay_v3_payment_status: 'idle', // idle, processing, success, failed
             };
         },
         props: {
@@ -237,6 +241,166 @@
             });
         },
         methods: {
+            // 向后兼容：验证并标准化微信支付参数（兼容v2和v3）
+            validateAndNormalizeWeChatPayParams(payData) {
+                if (!payData) {
+                    console.error('微信支付：支付参数为空');
+                    return false;
+                }
+                
+                // 检测是v2还是v3格式的数据
+                const isV3Format = payData.appId && payData.signType === 'RSA';
+                
+                if (isV3Format) {
+                    // v3格式验证
+                    const requiredV3Params = ['appId', 'timeStamp', 'nonceStr', 'package', 'signType', 'paySign'];
+                    for (let param of requiredV3Params) {
+                        if (!payData[param] || payData[param].toString().trim() === '') {
+                            console.error(`微信支付v3：缺少必要参数 ${param}`);
+                            return false;
+                        }
+                    }
+                    
+                    // 验证appId格式
+                    if (!/^wx[a-zA-Z0-9]{16}$/.test(payData.appId)) {
+                        console.error('微信支付v3：appId格式错误');
+                        return false;
+                    }
+                    
+                    // 验证时间戳
+                    if (!/^\d{10}$/.test(payData.timeStamp)) {
+                        console.error('微信支付v3：timeStamp格式错误');
+                        return false;
+                    }
+                    
+                    // 验证package格式
+                    if (!payData.package.startsWith('prepay_id=')) {
+                        console.error('微信支付v3：package格式错误');
+                        return false;
+                    }
+                    
+                    console.log('检测到微信支付v3格式参数，验证通过');
+                } else {
+                    // v2格式验证（兼容原有逻辑）
+                    const requiredV2Params = ['timeStamp', 'nonceStr', 'package', 'signType', 'paySign'];
+                    for (let param of requiredV2Params) {
+                        if (!payData[param] || payData[param].toString().trim() === '') {
+                            console.error(`微信支付v2：缺少必要参数 ${param}`);
+                            return false;
+                        }
+                    }
+                    
+                    console.log('检测到微信支付v2格式参数，验证通过');
+                }
+                
+                return true;
+            },
+
+            // 向后兼容：统一的微信支付执行方法
+            executeWeChatPayment(data, order_id) {
+                this.setData({
+                    wechat_pay_v3_payment_status: 'processing'
+                });
+                
+                // 构造标准的uni.requestPayment参数（保持v2格式兼容性）
+                const paymentParams = {
+                    timeStamp: data.data.timeStamp,
+                    nonceStr: data.data.nonceStr,
+                    package: data.data.package,
+                    signType: data.data.signType,
+                    paySign: data.data.paySign
+                };
+                
+                // 如果有appId参数（v3格式），也传递给uni.requestPayment
+                if (data.data.appId) {
+                    paymentParams.appId = data.data.appId;
+                }
+                
+                console.log('微信支付调用参数：', paymentParams);
+                
+                uni.requestPayment({
+                    ...paymentParams,
+                    success: (res) => {
+                        console.log('微信支付成功：', res);
+                        this.setData({
+                            wechat_pay_v3_payment_status: 'success',
+                            wechat_pay_v3_retry_count: 0
+                        });
+                        this.order_item_pay_success_handle(data, order_id);
+                    },
+                    fail: (res) => {
+                        this.handleWeChatPayError(res, data, order_id);
+                    }
+                });
+            },
+
+            // 统一的微信支付错误处理（兼容v2和v3）
+            handleWeChatPayError(res, data, order_id) {
+                let errorMsg = '';
+                const errorCode = res.errCode || res.errNo || null;
+                
+                // 通用错误码处理
+                switch (errorCode) {
+                    case -1:
+                        errorMsg = '用户取消支付';
+                        break;
+                    case -2:
+                        errorMsg = '网络错误，请重试';
+                        break;
+                    case -3:
+                        errorMsg = '系统错误，请稍后重试';
+                        break;
+                    case 'requestPayment:fail cancel':
+                        errorMsg = '用户取消支付';
+                        break;
+                    case 'requestPayment:fail (wx)':
+                        errorMsg = '微信支付失败，请检查参数';
+                        break;
+                    default:
+                        errorMsg = res.memo || res.errMsg || this.$t('paytips.paytips.6y488i');
+                }
+                
+                console.error('微信支付错误：', errorCode, errorMsg);
+                
+                // 重试机制（只对网络相关错误重试）
+                if (this.shouldRetryPayment(errorCode) && this.wechat_pay_v3_retry_count < this.wechat_pay_v3_max_retries) {
+                    this.retryWeChatPayment(data, order_id);
+                } else {
+                    this.setData({
+                        wechat_pay_v3_payment_status: 'failed'
+                    });
+                    this.order_item_pay_fail_handle(data, order_id, errorMsg + (errorCode ? `(${errorCode})` : ''));
+                }
+            },
+
+            // 重命名重试方法，保持兼容性
+            retryWeChatPayment(data, order_id) {
+                this.setData({
+                    wechat_pay_v3_retry_count: this.wechat_pay_v3_retry_count + 1
+                });
+                
+                console.log(`微信支付重试第${this.wechat_pay_v3_retry_count}次`);
+                
+                // 延迟重试
+                setTimeout(() => {
+                    this.executeWeChatPayment(data, order_id);
+                }, 1000 * this.wechat_pay_v3_retry_count);
+            },
+
+            // 判断是否应该重试
+            shouldRetryPayment(errorCode) {
+                const retryableErrors = [-2, -3, 'requestPayment:fail (wx)'];
+                return retryableErrors.includes(errorCode);
+            },
+
+            // 向后兼容：清理支付状态
+            cleanupWeChatPayState() {
+                this.setData({
+                    wechat_pay_v3_retry_count: 0,
+                    wechat_pay_v3_payment_status: 'idle'
+                });
+            },
+
             // 支付弹窗关闭
             payment_popup_event_close(e) {
                 this.setData({
@@ -599,19 +763,24 @@
                         }
                     });
                 } else {
+                    // 向后兼容：统一处理v2和v3后端返回的参数
+                    // #ifdef MP-WEIXIN
+                    if (!self.validateAndNormalizeWeChatPayParams(data.data)) {
+                        self.order_item_pay_fail_handle(data, order_id, self.$t('payment.payment.invalid_params'));
+                        return;
+                    }
+                    
+                    // 使用标准化后的参数执行支付
+                    self.executeWeChatPayment(data, order_id);
+                    // #endif
+                    
+                    // #ifndef MP-WEIXIN
                     uni.requestPayment({
                         // #ifdef MP-ALIPAY || MP-BAIDU || MP-TOUTIAO
                         orderInfo: data.data,
                         // #endif
                         // #ifdef MP-QQ
                         package: data.data,
-                        // #endif
-                        // #ifdef MP-WEIXIN
-                        timeStamp: data.data.timeStamp,
-                        nonceStr: data.data.nonceStr,
-                        package: data.data.package,
-                        signType: data.data.signType,
-                        paySign: data.data.paySign,
                         // #endif
                         // #ifdef MP-TOUTIAO
                         service: 5,
@@ -637,6 +806,8 @@
                             let code = res.resultCode || res.errCode || res.errNo || null;
                             self.order_item_pay_fail_handle(data, order_id, msg+(code == null ? '' : '('+code+')'));
                         },
+                    });
+                    // #endif
                     });
                 }
             },
@@ -670,27 +841,52 @@
                     window.location.href = data.data;
                 } else {
                     var status = false;
-                    // 微信jsapi
-                    if (data.payment.payment == 'Weixin' && (data.data.appId || null) != null && (data.data.timeStamp || null) != null && (data.data.nonceStr || null) != null && (data.data.package || null) != null && (data.data.signType || null) != null && (data.data.paySign || null) != null) {
+                    // 微信jsapi（兼容v2和v3）
+                    if (data.payment.payment == 'Weixin' && (data.data.timeStamp || null) != null && (data.data.nonceStr || null) != null && (data.data.package || null) != null && (data.data.signType || null) != null && (data.data.paySign || null) != null) {
                         status = true;
-
+                        
+                        // 向后兼容：验证参数（兼容v2和v3格式）
+                        if (!this.validateAndNormalizeWeChatPayParams(data.data)) {
+                            this.order_item_pay_fail_handle(data, order_id, '微信支付参数验证失败');
+                            return;
+                        }
+                        
+                        /**
+                         * 向后兼容：微信支付H5调用（兼容API v2和v3）
+                         * 保持原有调用方式不变，自动适配后端返回的参数格式
+                         */
                         function onBridgeReady() {
+                            // 构造标准调用参数（保持v2兼容性）
+                            const payParams = {
+                                appId: data.data.appId || app.globalData.get_global_data('common_wechat_appid', ''),
+                                timeStamp: data.data.timeStamp,
+                                nonceStr: data.data.nonceStr,
+                                package: data.data.package,
+                                signType: data.data.signType,
+                                paySign: data.data.paySign
+                            };
+                            
+                            // 兼容性日志
+                            const isV3Format = data.data.appId && data.data.signType === 'RSA';
+                            console.log(`微信支付H5调用 (${isV3Format ? 'v3' : 'v2'}格式):`, payParams);
+                            
                             WeixinJSBridge.invoke(
                                 'getBrandWCPayRequest',
-                                {
-                                    appId: data.data.appId,
-                                    timeStamp: data.data.timeStamp,
-                                    nonceStr: data.data.nonceStr,
-                                    package: data.data.package,
-                                    signType: data.data.signType,
-                                    paySign: data.data.paySign,
-                                },
+                                payParams,
                                 function (res) {
+                                    // 统一的结果处理
+                                    console.log('微信支付H5结果：', res);
                                     if (res.err_msg == 'get_brand_wcpay_request:ok') {
-                                        // 数据设置
                                         self.order_item_pay_success_handle(data, order_id);
                                     } else {
-                                        self.order_item_pay_fail_handle(data, order_id, res.err_msg);
+                                        // 友好的错误处理
+                                        let errorMsg = res.err_msg;
+                                        if (res.err_msg.includes('cancel')) {
+                                            errorMsg = '用户取消支付';
+                                        } else if (res.err_msg.includes('fail')) {
+                                            errorMsg = '支付失败，请重试';
+                                        }
+                                        self.order_item_pay_fail_handle(data, order_id, errorMsg);
                                     }
                                 }
                             );
@@ -871,6 +1067,8 @@
             // 页面卸载
             onUnload(e) {
                 clearInterval(this.pay_statuc_check_timer);
+                // 向后兼容：清理微信支付状态
+                this.cleanupWeChatPayState();
             },
             // 支付html展示窗口事件
             popup_view_pay_html_event_close(e) {

@@ -148,25 +148,99 @@
                         pay_status: 0,
                         pay_msg: this.$t('common.payment_in_text'),
                     });
-                    uni.requestPayment({
+                    
+                    // 向后兼容：收银台微信支付参数验证（兼容v2和v3）
+                    if (!this.validateWeChatPayParams(this.data.pay_data)) {
+                        this.setData({
+                            pay_status: 2,
+                            pay_msg: '微信支付参数验证失败',
+                        });
+                        return;
+                    }
+                    
+                    // 向后兼容：构造标准支付参数（保持v2格式兼容性）
+                    const paymentParams = {
                         timeStamp: this.data.pay_data.timeStamp,
                         nonceStr: this.data.pay_data.nonceStr,
                         package: this.data.pay_data.package,
                         signType: this.data.pay_data.signType,
-                        paySign: this.data.pay_data.paySign,
+                        paySign: this.data.pay_data.paySign
+                    };
+                    
+                    // 如果有appId参数（v3格式），也包含进去
+                    if (this.data.pay_data.appId) {
+                        paymentParams.appId = this.data.pay_data.appId;
+                    }
+                    
+                    // 兼容性日志
+                    const isV3Format = this.data.pay_data.appId && this.data.pay_data.signType === 'RSA';
+                    console.log(`收银台微信支付 (${isV3Format ? 'v3' : 'v2'}格式):`, paymentParams);
+                    
+                    // 微信支付调用（保持原有接口不变）
+                    uni.requestPayment({
+                        ...paymentParams,
                         success: (res) => {
+                            console.log('收银台微信支付成功：', res);
                             this.setData({
                                 pay_status: 1,
                                 pay_msg: this.$t('paytips.paytips.679rxu'),
                             });
                         },
                         fail: (res) => {
+                            console.error('收银台微信支付失败：', res);
                             this.setData({
                                 pay_status: 2,
-                                pay_msg: this.$t('paytips.paytips.6y488i'),
+                                pay_msg: this.getPaymentErrorMessage(res),
                             });
                         },
                     });
+                }
+            },
+
+            // 向后兼容：收银台参数验证方法（兼容v2和v3）
+            validateWeChatPayParams(payData) {
+                if (!payData) {
+                    console.error('收银台微信支付：支付参数为空');
+                    return false;
+                }
+                
+                // 通用必要参数验证
+                const requiredParams = ['timeStamp', 'nonceStr', 'package', 'signType', 'paySign'];
+                for (let param of requiredParams) {
+                    if (!payData[param] || payData[param].toString().trim() === '') {
+                        console.error(`收银台微信支付：缺少必要参数 ${param}`);
+                        return false;
+                    }
+                }
+                
+                // 检测并验证格式
+                const isV3Format = payData.appId && payData.signType === 'RSA';
+                if (isV3Format) {
+                    // v3格式额外验证appId
+                    if (!/^wx[a-zA-Z0-9]{16}$/.test(payData.appId)) {
+                        console.error('收银台微信支付v3：appId格式错误');
+                        return false;
+                    }
+                    console.log('收银台检测到微信支付v3格式参数');
+                } else {
+                    console.log('收银台检测到微信支付v2格式参数');
+                }
+                
+                return true;
+            },
+
+            // 向后兼容：收银台错误消息处理
+            getPaymentErrorMessage(res) {
+                const errorCode = res.errCode || res.errNo || null;
+                switch (errorCode) {
+                    case -1:
+                        return '用户取消支付';
+                    case -2:
+                        return '网络错误，请重试';
+                    case -3:
+                        return '系统错误，请稍后重试';
+                    default:
+                        return res.errMsg || this.$t('paytips.paytips.6y488i');
                 }
             }
         }
